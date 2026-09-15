@@ -1,0 +1,3 @@
+d /var/lib/matrix-mautrix-discord 0750 matrix-mautrix-discord matrix-mautrix-discord -
+d /var/log/matrix-mautrix-discord 0750 matrix-mautrix-discord matrix-mautrix-discord -
+d /etc/matrix-mautrix-discord 0750 matrix-mautrix-discord matrix-mautrix-discord -

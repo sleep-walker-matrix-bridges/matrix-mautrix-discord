@@ -1,0 +1,111 @@
+Fetching vulnerabilities from the database...
+
+Checking the code against the vulnerabilities...
+
+The package pattern matched the following 5 root packages:
+  go.mau.fi/mautrix-discord/config
+  go.mau.fi/mautrix-discord/database/upgrades
+  go.mau.fi/mautrix-discord/database
+  go.mau.fi/mautrix-discord/remoteauth
+  go.mau.fi/mautrix-discord
+Govulncheck scanned the following 43 modules and the go1.27.1 standard library:
+  go.mau.fi/mautrix-discord
+  github.com/andybalholm/brotli@v1.2.2
+  github.com/beeper/discordgo@v0.0.0-20260808090638-8051e14a4471
+  github.com/beeper/discordgo@v0.0.0-20260808090638-8051e14a4471
+  github.com/beeper/req/v3@v3.0.0-20260808092221-1540c0bf3d1a
+  github.com/beeper/req/v3@v3.0.0-20260808092221-1540c0bf3d1a
+  github.com/coder/websocket@v1.8.14
+  github.com/coreos/go-systemd/v22@v22.7.0
+  github.com/gabriel-vasile/mimetype@v1.4.15
+  github.com/google/go-querystring@v1.2.0
+  github.com/google/shlex@v0.0.0-20191202100458-e7afc7fbc510
+  github.com/google/uuid@v1.6.0
+  github.com/gorilla/mux@v1.8.0
+  github.com/gorilla/websocket@v1.5.0
+  github.com/icholy/digest@v1.2.0
+  github.com/klauspost/compress@v1.19.2
+  github.com/lib/pq@v1.12.3
+  github.com/mattn/go-colorable@v0.1.14
+  github.com/mattn/go-isatty@v0.0.20
+  github.com/mattn/go-sqlite3@v1.14.49
+  github.com/quic-go/qpack@v0.6.0
+  github.com/quic-go/quic-go@v0.61.0
+  github.com/refraction-networking/utls@v1.8.2
+  github.com/rs/zerolog@v1.35.1
+  github.com/skip2/go-qrcode@v0.0.0-20200617195104-da1b6568686e
+  github.com/tidwall/gjson@v1.18.0
+  github.com/tidwall/match@v1.1.1
+  github.com/tidwall/pretty@v1.2.1
+  github.com/tidwall/sjson@v1.2.5
+  github.com/yuin/goldmark@v1.8.5
+  go.mau.fi/util@v0.2.2-0.20231228160422-22fdd4bbddeb
+  go.mau.fi/zeroconfig@v0.1.2
+  golang.org/x/crypto@v0.55.0
+  golang.org/x/exp@v0.0.0-20260813180055-c1d0aacb2297
+  golang.org/x/net@v0.58.0
+  golang.org/x/sync@v0.22.0
+  golang.org/x/sys@v0.47.0
+  golang.org/x/text@v0.41.0
+  gopkg.in/natefinch/lumberjack.v2@v2.2.1
+  gopkg.in/yaml.v3@v3.0.1
+  maunium.net/go/mauflag@v1.0.0
+  maunium.net/go/maulogger/v2@v2.4.1
+  maunium.net/go/mautrix@v0.16.3-0.20250810202616-6bc5698125c2
+
+=== Symbol Results ===
+
+Vulnerability #1: GO-2026-6278
+    Gorilla WebSocket Uses Cryptographically Weak PRNG for WebSocket Mask Key in
+    github.com/gorilla/websocket
+  More info: https://pkg.go.dev/vuln/GO-2026-6278
+  Module: github.com/gorilla/websocket
+    Found in: github.com/gorilla/websocket@v1.5.0
+    Fixed in: github.com/gorilla/websocket@v1.5.3
+    Example traces found:
+      #1: remoteauth/client.go:101:21: remoteauth.Client.close calls websocket.Conn.Close
+      #2: main.go:207:9: mautrix.main calls bridge.Bridge.Main, which eventually calls websocket.Conn.ReadJSON
+      #3: remoteauth/serverpackets.go:28:39: remoteauth.Client.processMessages calls websocket.Conn.ReadMessage
+      #4: main.go:207:9: mautrix.main calls bridge.Bridge.Main, which eventually calls websocket.Conn.WriteJSON
+      #5: remoteauth/client.go:92:21: remoteauth.Client.close calls websocket.Conn.WriteMessage
+      #6: main.go:207:9: mautrix.main calls bridge.Bridge.Main, which eventually calls websocket.Dialer.Dial
+      #7: remoteauth/client.go:65:53: remoteauth.Client.Dial calls websocket.Dialer.DialContext
+      #8: provisioning.go:246:28: mautrix.ProvisioningAPI.qrLogin calls websocket.Upgrader.Upgrade
+      #9: config/upgrade.go:74:44: config.DoUpgrade calls federation.GenerateSigningKey, which eventually calls websocket.flateReadWrapper.Read
+      #10: main.go:207:9: mautrix.main calls bridge.Bridge.Main, which eventually calls websocket.flateWriteWrapper.Write
+      #11: config/upgrade.go:74:44: config.DoUpgrade calls federation.GenerateSigningKey, which eventually calls websocket.messageReader.Read
+      #12: main.go:207:9: mautrix.main calls bridge.Bridge.Main, which eventually calls websocket.messageWriter.Write
+      #13: main.go:207:9: mautrix.main calls bridge.Bridge.Main, which eventually calls websocket.truncWriter.Write
+
+=== Package Results ===
+
+No other vulnerabilities found.
+
+=== Module Results ===
+
+Vulnerability #1: GO-2026-6355
+    Prevent DoS on deadlocked established channel in golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-6355
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.55.0
+    Fixed in: golang.org/x/crypto@v0.56.0
+
+Vulnerability #2: GO-2026-6354
+    Prevent DoS on deadlocked undecided channel in golang.org/x/crypto/ssh
+  More info: https://pkg.go.dev/vuln/GO-2026-6354
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.55.0
+    Fixed in: golang.org/x/crypto@v0.56.0
+
+Vulnerability #3: GO-2026-5932
+    The golang.org/x/crypto/openpgp package is unmaintained, unsafe by design,
+    and has known security issues
+  More info: https://pkg.go.dev/vuln/GO-2026-5932
+  Module: golang.org/x/crypto
+    Found in: golang.org/x/crypto@v0.55.0
+    Fixed in: N/A
+
+Your code is affected by 1 vulnerability from 1 module.
+This scan also found 0 vulnerabilities in packages you import and 3
+vulnerabilities in modules you require, but your code doesn't appear to call
+these vulnerabilities.
