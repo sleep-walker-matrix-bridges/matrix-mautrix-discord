@@ -1,0 +1,52 @@
+Scanning dir .
+Starting filesystem walk for root: /
+Scanned /home/tcech/matrix-mautrix-packaging/mautrix-discord-src/go.mod file and found 45 packages
+End status: 24 dirs visited, 141 inodes visited, 1 Extract calls, 1.954373ms elapsed, 1.954683ms wall time
+Failed to run code analysis (govulncheck) on '/home/tcech/matrix-mautrix-packaging/mautrix-discord-src/go.mod' because govulncheck: Loading packages failed, possibly due to a mismatch between the Go version
+used to build govulncheck and the Go version on PATH. Consider rebuilding
+govulncheck with the current Go version.
+
+
+There are errors with the provided package patterns:
+
+/usr/lib64/go/1.27/src/internal/poll/splice_linux.go:237:21: unknown field rfd in struct literal of type splicePipe
+/usr/lib64/go/1.27/src/internal/poll/splice_linux.go:237:34: unknown field wfd in struct literal of type splicePipe
+-: This application uses version go1.26 of the source-processing packages but runs version go1.27 of 'go list'. It may fail to process source files that rely on newer language features. If so, rebuild the application using a newer version of Go.
+/usr/lib64/go/1.27/src/math/rand/v2/rand.go:213:17: method must have no type parameters
+/usr/lib64/go/1.27/src/math/rand/v2/rand.go:213:33: Int (function) is not a type
+/usr/lib64/go/1.27/src/math/rand/v2/rand.go:213:38: Int (function) is not a type
+/usr/lib64/go/1.27/src/math/rand/v2/rand.go:217:13: too many arguments in call to Int
+	have (uint64)
+	want ()
+-: This application uses version go1.26 of the source-processing packages but runs version go1.27 of 'go list'. It may fail to process source files that rely on newer language features. If so, rebuild the application using a newer version of Go.
+/usr/lib64/go/1.27/src/vendor/golang.org/x/text/unicode/bidi/tables17.0.0.go:5:9: file requires newer Go version go1.27 (application built with go1.26)
+-: This application uses version go1.26 of the source-processing packages but runs version go1.27 of 'go list'. It may fail to process source files that rely on newer language features. If so, rebuild the application using a newer version of Go.
+/usr/lib64/go/1.27/src/vendor/golang.org/x/text/unicode/norm/tables17.0.0.go:5:9: file requires newer Go version go1.27 (application built with go1.26)
+-: This application uses version go1.26 of the source-processing packages but runs version go1.27 of 'go list'. It may fail to process source files that rely on newer language features. If so, rebuild the application using a newer version of Go.
+/usr/lib64/go/1.27/src/vendor/golang.org/x/net/idna/tables17.0.0.go:5:9: file requires newer Go version go1.27 (application built with go1.26)
+-: This application uses version go1.26 of the source-processing packages but runs version go1.27 of 'go list'. It may fail to process source files that rely on newer language features. If so, rebuild the application using a newer version of Go.
+/home/tcech/go/pkg/mod/golang.org/x/text@v0.41.0/unicode/bidi/tables17.0.0.go:5:9: file requires newer Go version go1.27 (application built with go1.26)
+-: This application uses version go1.26 of the source-processing packages but runs version go1.27 of 'go list'. It may fail to process source files that rely on newer language features. If so, rebuild the application using a newer version of Go.
+/home/tcech/go/pkg/mod/golang.org/x/text@v0.41.0/unicode/norm/tables17.0.0.go:5:9: file requires newer Go version go1.27 (application built with go1.26)
+-: This application uses version go1.26 of the source-processing packages but runs version go1.27 of 'go list'. It may fail to process source files that rely on newer language features. If so, rebuild the application using a newer version of Go.
+/home/tcech/go/pkg/mod/golang.org/x/net@v0.58.0/idna/tables17.0.0.go:5:9: file requires newer Go version go1.27 (application built with go1.26)
+-: This application uses version go1.26 of the source-processing packages but runs version go1.27 of 'go list'. It may fail to process source files that rely on newer language features. If so, rebuild the application using a newer version of Go.
+/home/tcech/go/pkg/mod/github.com/quic-go/quic-go@v0.61.0/internal/handshake/tls_config_go127.go:3:9: file requires newer Go version go1.27 (application built with go1.26)
+-: This application uses version go1.26 of the source-processing packages but runs version go1.27 of 'go list'. It may fail to process source files that rely on newer language features. If so, rebuild the application using a newer version of Go.
+
+For details on package patterns, see https://pkg.go.dev/cmd/go#hdr-Package_lists_and_patterns.
+
+(the Go toolchain is required)
+
+Total 2 packages affected by 4 known vulnerabilities (0 Critical, 0 High, 1 Medium, 0 Low, 3 Unknown) from 1 ecosystem.
+3 vulnerabilities can be fixed.
+
++-------------------------------------+------+-----------+------------------------------+---------+---------------+--------+
+| OSV URL                             | CVSS | ECOSYSTEM | PACKAGE                      | VERSION | FIXED VERSION | SOURCE |
++-------------------------------------+------+-----------+------------------------------+---------+---------------+--------+
+| https://osv.dev/GO-2026-6278        | 6.9  | Go        | github.com/gorilla/websocket | 1.5.0   | 1.5.3         | go.mod |
+| https://osv.dev/GHSA-w67g-5rqw-f597 |      |           |                              |         |               |        |
+| https://osv.dev/GO-2026-5932        |      | Go        | golang.org/x/crypto          | 0.55.0  | --            | go.mod |
+| https://osv.dev/GO-2026-6354        |      | Go        | golang.org/x/crypto          | 0.55.0  | 0.56.0        | go.mod |
+| https://osv.dev/GO-2026-6355        |      | Go        | golang.org/x/crypto          | 0.55.0  | 0.56.0        | go.mod |
++-------------------------------------+------+-----------+------------------------------+---------+---------------+--------+

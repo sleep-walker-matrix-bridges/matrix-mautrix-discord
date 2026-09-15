@@ -1,0 +1,32 @@
+[Unit]
+Description=Matrix-Discord puppeting bridge (mautrix-discord)
+Documentation=https://docs.mau.fi/bridges/go/discord/index.html
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=matrix-mautrix-discord
+Group=matrix-mautrix-discord
+ExecStart=/usr/bin/matrix-mautrix-discord -c /etc/matrix-mautrix-discord/config.yaml
+WorkingDirectory=/var/lib/matrix-mautrix-discord
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/var/lib/matrix-mautrix-discord /var/log/matrix-mautrix-discord /etc/matrix-mautrix-discord
+
+[Install]
+WantedBy=multi-user.target

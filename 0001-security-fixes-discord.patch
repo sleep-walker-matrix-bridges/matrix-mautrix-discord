@@ -1,0 +1,79 @@
+From 4f34e278052c6798d5edbf5209af81c4afb5efd6 Mon Sep 17 00:00:00 2001
+From: sleep-walker <sleep_walker@gnu.org>
+Date: Tue, 15 Sep 2026 23:28:32 +0200
+Subject: [PATCH] Bump gorilla/websocket to v1.5.3 and x/crypto to v0.56.0
+ (security)
+
+gorilla/websocket@1.5.0 used math/rand (predictable) instead of
+crypto/rand for WebSocket frame mask key generation (GO-2026-6278,
+CVSS 6.9) -- reachable via the remoteauth/QR-login websocket flow per
+govulncheck call-graph analysis, unlike the telegram/whatsapp x/crypto
+findings which were unreachable. This is the first bridge in the
+migration series with an actually exploitable finding.
+
+Also bumps golang.org/x/crypto to 0.56.0 (GO-2026-6354, GO-2026-6355,
+same unreachable SSH-client DoS findings as the other bridges).
+---
+ go.mod | 6 +++---
+ go.sum | 8 ++++----
+ 2 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/go.mod b/go.mod
+index 68d1bc0..2699c85 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,6 +1,6 @@
+ module go.mau.fi/mautrix-discord
+ 
+-go 1.25.0
++go 1.26.0
+ 
+ toolchain go1.26.6
+ 
+@@ -9,7 +9,7 @@ require (
+ 	github.com/gabriel-vasile/mimetype v1.4.15
+ 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
+ 	github.com/gorilla/mux v1.8.0
+-	github.com/gorilla/websocket v1.5.0
++	github.com/gorilla/websocket v1.5.3
+ 	github.com/imroc/req/v3 v3.60.0
+ 	github.com/lib/pq v1.12.3
+ 	github.com/mattn/go-sqlite3 v1.14.49
+@@ -45,7 +45,7 @@ require (
+ 	github.com/tidwall/pretty v1.2.1 // indirect
+ 	github.com/tidwall/sjson v1.2.5 // indirect
+ 	go.mau.fi/zeroconfig v0.1.2 // indirect
+-	golang.org/x/crypto v0.55.0 // indirect
++	golang.org/x/crypto v0.56.0 // indirect
+ 	golang.org/x/net v0.58.0 // indirect
+ 	golang.org/x/sys v0.47.0 // indirect
+ 	golang.org/x/text v0.41.0 // indirect
+diff --git a/go.sum b/go.sum
+index 45e5a74..f5fb341 100644
+--- a/go.sum
++++ b/go.sum
+@@ -25,8 +25,8 @@ github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+ github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+ github.com/gorilla/mux v1.8.0 h1:i40aqfkR1h2SlN9hojwV5ZA91wcXFOvkdNIeFDP5koI=
+ github.com/gorilla/mux v1.8.0/go.mod h1:DVbg23sWSpFRCP0SfiEN6jmj59UnW/n46BH5rLB71So=
+-github.com/gorilla/websocket v1.5.0 h1:PPwGk2jz7EePpoHN/+ClbZu8SPxiqlu12wZP/3sWmnc=
+-github.com/gorilla/websocket v1.5.0/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
++github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
++github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
+ github.com/icholy/digest v1.2.0 h1:oTbG4IsNOmidJ+421ehG7Ty93yt1yotq13kFMG569yw=
+ github.com/icholy/digest v1.2.0/go.mod h1:1P1+LzUv48ybX7bu8tVpZ2QWdd+xRuePNuGawHjwRUE=
+ github.com/klauspost/compress v1.19.2 h1:hMRETovs/pu/dVWN7zIT1PGG8t509MwT6bO7XSi26R8=
+@@ -82,8 +82,8 @@ go.mau.fi/zeroconfig v0.1.2 h1:DKOydWnhPMn65GbXZOafgkPm11BvFashZWLct0dGFto=
+ go.mau.fi/zeroconfig v0.1.2/go.mod h1:NcSJkf180JT+1IId76PcMuLTNa1CzsFFZ0nBygIQM70=
+ go.uber.org/mock v0.6.0 h1:hyF9dfmbgIX5EfOdasqLsWD6xqpNZlXblLB/Dbnwv3Y=
+ go.uber.org/mock v0.6.0/go.mod h1:KiVJ4BqZJaMj4svdfmHM0AUx4NJYO8ZNpPnZn1Z+BBU=
+-golang.org/x/crypto v0.55.0 h1:+KWHjbgOaAQ66dh/YlkZKHlz9ZUlq61AFirAR9ntP8M=
+-golang.org/x/crypto v0.55.0/go.mod h1:uq0V9dE/fzQuJtbnL+2EhWOE63vo164FY8xqEnV9xis=
++golang.org/x/crypto v0.56.0 h1:GUh5Ii4J5jtcseSMiRqr1jXCNHoxjeV9Fmekc2oLy6Y=
++golang.org/x/crypto v0.56.0/go.mod h1:OMW5y6CY9l38uPLmxU6l6pwcXp1obtLo3e6gT7gQR2I=
+ golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297 h1:YXnL44eJ77R+ji4/ooy8UsXIhz+lbi2Qgdlc8iRN0gY=
+ golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297/go.mod h1:Mkmymgv+uMpSQ/XxJ/7GpdrdYoqm3u72jEbpCLiJmNk=
+ golang.org/x/net v0.58.0 h1:ynWG7rqYi4ccpTEuPZ2QGWHktVEM9DMCj9yzDE0Q7To=
+-- 
+2.55.0
+
