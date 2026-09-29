@@ -114,10 +114,11 @@ the user asked to ship it now. Old binary + DB backed up on doom under
 Verified live: `thread` DB table populated (forum posts electing real
 roots), no panics/restarts, portal/puppet counts grew as expected.
 
-**Follow-up still needed**: fold `0002-forum-thread-bridging.patch` into
-the OBS package properly (bump Release, add Patch1, rebuild via OBS) so
-the RPM matches what's actually running and a future `zypper update`
-doesn't silently overwrite this hotfix with the old un-patched binary.
+**Follow-up still needed**: fold `0002-forum-thread-bridging.patch` AND
+`0003-manual-backfill-command.patch` into the OBS package properly (bump
+Release, add Patch1/Patch2, rebuild via OBS) so the RPM matches what's
+actually running and a future `zypper update` doesn't silently overwrite
+these hotfixes with the old unpatched binary.
 Known LOW-severity follow-ups from review (not deploy blockers): N2 dead
 code, N3 (same ThreadID-blanking bug in `convertMessageBatch`'s backfill
 path, pre-existing, same fix shape as N1), N4 error-wrap loses type info,
@@ -129,3 +130,75 @@ NOT actually guard against N1 regressing — they pass even with the bug
 reintroduced. Needs a real regression test driving
 `handleDiscordMessageCreate` itself, or the tests should be removed so
 they stop implying coverage they don't provide.
+
+## Manual thread-history backfill command (2026-09-29)
+
+`0003-manual-backfill-command.patch` adds a `!discord backfill [count]`
+admin command (reply to any message inside a bridged Discord thread; a
+room moderator can pull up to 500 older messages that predate when the
+bridge first saw that thread — fixes missing context for reactions on
+old messages in threads bridged after they already had history).
+
+Developed on the same `forum-thread-support` branch, 5 commits
+(248244f..71186bd), through the same Sonnet/Opus-writes + Opus-reviews
+loop as the forum-thread work — but this round specifically surfaced a
+routing mistake in HOW the writing side was dispatched: rounds 1-3 were
+sent via `delegate_task`, which silently runs on Haiku (the Hermes
+`delegation.model` default) rather than the `code-writer` profile's own
+configured Opus model, despite looking like an "Opus writes, Opus
+reviews" loop. This produced two real, independently-caught bugs beyond
+what review alone found: a lock-scope bug (forwardBackfillLock released
+before the actual async work ran, providing zero protection) and a
+wrong-pagination-direction bug (reused an existing helper with
+stop-at-already-bridged semantics instead of genuinely fetching older
+history — would have silently reported "no messages found" in
+production). Both were caught by the orchestrating Dispatcher's own
+independent code reading BEFORE reaching formal review, and fixed in a
+round-2 pass. Round 3's formal Opus review then found three further
+Medium findings: M1 (cross-portal thread resolution — a moderator could
+leak another Discord channel's message history into the wrong Matrix
+room and silently defeat the concurrency lock), M2 (the batch-send path
+never recorded Discord thread membership in the DB, making the backfill
+cursor blind to that history on hungryserv-capable homeservers — same
+"reports zero even though history exists" symptom via a different
+route), and M3 (missing login requirement + no nil-Session guard, a
+disconnected user's command silently hangs forever via a swallowed
+panic). Round 3's own pagination-direction test was also found
+inadequate (tested unrelated helper functions, not the real function) —
+same "looks like coverage but isn't" mistake this branch has made once
+before, caught again by review rather than by trusting the round's own
+report.
+
+After the routing mistake was identified and corrected (user caught the
+pattern: "když používáš [Haiku] na psaní kódu, tak se dostáváš do
+problémů se zamykáním" — see dispatcher-team-routing skill, now records
+this as a standing pitfall), round 4 (fixing M1/M2/M3) and round 5
+(building a genuine HTTP-level pagination test via an httptest.Server
+intercepting discordgo's real HTTP client, with two self-administered
+mutation tests proving the test actually catches a broken pagination
+direction) were both dispatched via the `code-writer` CLI profile
+(confirmed running claude-opus-5), not `delegate_task`. Final review
+(round 5, full 5-commit feature reviewed end-to-end for the first time)
+returned VERDICT: PASS — independently re-verified both round-2 bugs,
+all three Medium findings, ran its own two additional mutation tests
+(surfacing two Low-severity, non-blocking test-coverage gaps around
+`foundAll` accuracy), and confirmed no single fix regressed another.
+
+**Deployed 2026-09-29** as a manual hotfix on doom, same procedure as
+0002 (local build matching spec flags, checksum verified, old binary +
+DB backed up under `/root/matrix-mautrix-discord-backup-<timestamp>/`,
+restart). Verified live: service stable 2.5+ minutes, `NRestarts=0`, no
+panics, new command's string literals present in the compiled binary
+(`Backfilling up to %d older messages…`), DB counts unchanged/sane.
+
+Outstanding Low follow-ups from the round-5 review (not blockers):
+inaccurate code comments (backfill.go's "none of these acquire
+forwardBackfillLock" claim is imprecise though the no-deadlock
+conclusion holds; a test-stub comment about after/around), two
+uncovered edge cases in the truncation/limit-boundary logic (`foundAll`
+correctness on an exact-limit-overshooting short final page; one
+redundant API call on an exact-multiple limit), M3's user-facing error
+message says "no messages found" rather than "not connected" (correct
+code, misleading text), and `!backfill` won't work inside DM/group-DM
+threads (fails closed, not a security issue — just a known limitation
+inherited from base bridge behavior).
