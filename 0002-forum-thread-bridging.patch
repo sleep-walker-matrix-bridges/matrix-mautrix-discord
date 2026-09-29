@@ -1,0 +1,1313 @@
+diff --git a/backfill.go b/backfill.go
+index c4966bd..f2443e9 100644
+--- a/backfill.go
++++ b/backfill.go
+@@ -241,15 +241,30 @@ func (portal *Portal) forwardBatchSend(log zerolog.Logger, source *User, message
+ }
+ 
+ func (portal *Portal) convertMessageBatch(log zerolog.Logger, source *User, messages []*discordgo.Message, thread *Thread) ([]*event.Event, []*discordgo.Message, []database.Message) {
+-	var discordThreadID string
+ 	var threadRootEvent, lastThreadEvent id.EventID
++	// replyThreadID is only used for resolving reply targets, which is valid regardless
++	// of whether the messages end up recorded as part of the thread.
++	var replyThreadID string
+ 	if thread != nil {
+-		discordThreadID = thread.ID
+-		threadRootEvent = thread.RootMXID
+-		lastThreadEvent = threadRootEvent
+-		lastInThread := portal.bridge.DB.Message.GetLastInThread(portal.Key, thread.ID)
+-		if lastInThread != nil {
+-			lastThreadEvent = lastInThread.MXID
++		replyThreadID = thread.ID
++		ctx := log.WithContext(context.Background())
++		// Elect (or look up) the thread root. Either it returns a root that exists on
++		// the homeserver and is recorded in the thread row, or it fails immediately.
++		root, err := thread.EnsureRoot(ctx)
++		if err != nil {
++			// No valid root: backfill into the main timeline and do NOT record the
++			// messages as part of the thread, so there is nothing to reconcile later.
++			log.Warn().Err(err).
++				Str("thread_id", thread.ID).
++				Msg("No thread root available, backfilling messages without thread relation")
++		} else {
++			threadRootEvent = root
++			lastThreadEvent = root
++
++			lastInThread := portal.bridge.DB.Message.GetLastInThread(portal.Key, thread.ID)
++			if lastInThread != nil {
++				lastThreadEvent = lastInThread.MXID
++			}
+ 		}
+ 	}
+ 
+@@ -266,7 +281,7 @@ func (portal *Portal) convertMessageBatch(log zerolog.Logger, source *User, mess
+ 		puppet := portal.bridge.GetPuppetByID(msg.Author.ID)
+ 		puppet.UpdateInfo(source, msg.Author, msg)
+ 		intent := puppet.IntentFor(portal)
+-		replyTo := portal.getReplyTarget(source, discordThreadID, msg.MessageReference, msg.Embeds, true)
++		replyTo := portal.getReplyTarget(source, replyThreadID, msg.MessageReference, msg.Embeds, true)
+ 		mentions := portal.convertDiscordMentions(msg, false)
+ 
+ 		ts, _ := discordgo.SnowflakeTimestamp(msg.ID)
+diff --git a/database/thread.go b/database/thread.go
+index 87f4127..3853ee2 100644
+--- a/database/thread.go
++++ b/database/thread.go
+@@ -15,7 +15,7 @@ type ThreadQuery struct {
+ }
+ 
+ const (
+-	threadSelect = "SELECT dcid, parent_chan_id, root_msg_dcid, root_msg_mxid, creation_notice_mxid FROM thread"
++	threadSelect = "SELECT dcid, parent_chan_id, root_msg_dcid, root_msg_mxid, creation_notice_mxid, is_forum_post FROM thread"
+ )
+ 
+ func (tq *ThreadQuery) New() *Thread {
+@@ -69,10 +69,19 @@ type Thread struct {
+ 	RootMXID      id.EventID
+ 
+ 	CreationNoticeMXID id.EventID
++
++	// IsForumPost is a persisted discriminator for the thread kind, set explicitly at
++	// INSERT time. Forum post threads have no pre-existing root message on either side:
++	// the thread creation notice itself is elected as the Matrix thread root
++	// (self-rooting). Normal threads always have a root message that already exists on
++	// Matrix, and the creation notice relates to that root instead.
++	// This must NOT be re-derived from RootMXID/RootDiscordID, which are mutable and
++	// were previously shown to be unreliable heuristics.
++	IsForumPost bool
+ }
+ 
+ func (t *Thread) Scan(row dbutil.Scannable) *Thread {
+-	err := row.Scan(&t.ID, &t.ParentID, &t.RootDiscordID, &t.RootMXID, &t.CreationNoticeMXID)
++	err := row.Scan(&t.ID, &t.ParentID, &t.RootDiscordID, &t.RootMXID, &t.CreationNoticeMXID, &t.IsForumPost)
+ 	if err != nil {
+ 		if !errors.Is(err, sql.ErrNoRows) {
+ 			t.log.Errorln("Database scan failed:", err)
+@@ -84,8 +93,8 @@ func (t *Thread) Scan(row dbutil.Scannable) *Thread {
+ }
+ 
+ func (t *Thread) Insert() {
+-	query := "INSERT INTO thread (dcid, parent_chan_id, root_msg_dcid, root_msg_mxid, creation_notice_mxid) VALUES ($1, $2, $3, $4, $5)"
+-	_, err := t.db.Exec(query, t.ID, t.ParentID, t.RootDiscordID, t.RootMXID, t.CreationNoticeMXID)
++	query := "INSERT INTO thread (dcid, parent_chan_id, root_msg_dcid, root_msg_mxid, creation_notice_mxid, is_forum_post) VALUES ($1, $2, $3, $4, $5, $6)"
++	_, err := t.db.Exec(query, t.ID, t.ParentID, t.RootDiscordID, t.RootMXID, t.CreationNoticeMXID, t.IsForumPost)
+ 	if err != nil {
+ 		t.log.Warnfln("Failed to insert %s@%s: %v", t.ID, t.ParentID, err)
+ 		panic(err)
+@@ -101,6 +110,16 @@ func (t *Thread) Update() {
+ 	}
+ }
+ 
++// UpdateMatrixIDs updates both root_msg_mxid and creation_notice_mxid in one statement.
++func (t *Thread) UpdateMatrixIDs() {
++	query := "UPDATE thread SET root_msg_mxid=$2, creation_notice_mxid=$3 WHERE dcid=$1"
++	_, err := t.db.Exec(query, t.ID, t.RootMXID, t.CreationNoticeMXID)
++	if err != nil {
++		t.log.Warnfln("Failed to update Matrix IDs for %s@%s: %v", t.ID, t.ParentID, err)
++		panic(err)
++	}
++}
++
+ func (t *Thread) Delete() {
+ 	query := "DELETE FROM thread WHERE dcid=$1 AND parent_chan_id=$2"
+ 	_, err := t.db.Exec(query, t.ID, t.ParentID)
+diff --git a/database/upgrades/25-thread-is-forum-post.sql b/database/upgrades/25-thread-is-forum-post.sql
+new file mode 100644
+index 0000000..8d44dc3
+--- /dev/null
++++ b/database/upgrades/25-thread-is-forum-post.sql
+@@ -0,0 +1,6 @@
++-- v25 (compatible with v19+): Explicitly mark forum post threads
++ALTER TABLE thread ADD COLUMN is_forum_post BOOLEAN NOT NULL DEFAULT false;
++-- Backfill: only the forum post path ever inserted a thread row with an empty
++-- root_msg_mxid, so this one-time migration can safely use that as the
++-- discriminator. New rows always set the column explicitly.
++UPDATE thread SET is_forum_post=true WHERE root_msg_mxid='';
+diff --git a/discord.go b/discord.go
+index 37cddbc..47c36e1 100644
+--- a/discord.go
++++ b/discord.go
+@@ -8,7 +8,7 @@ import (
+ 
+ func (user *User) channelIsBridgeable(channel *discordgo.Channel) bool {
+ 	switch channel.Type {
+-	case discordgo.ChannelTypeGuildText, discordgo.ChannelTypeGuildNews:
++	case discordgo.ChannelTypeGuildText, discordgo.ChannelTypeGuildNews, discordgo.ChannelTypeGuildForum, discordgo.ChannelTypeGuildMedia:
+ 		// allowed
+ 	case discordgo.ChannelTypeDM, discordgo.ChannelTypeGroupDM:
+ 		// DMs are always bridgeable, no need for permission checks
+diff --git a/portal.go b/portal.go
+index db26a0e..554724b 100644
+--- a/portal.go
++++ b/portal.go
+@@ -647,16 +647,34 @@ func (portal *Portal) handleDiscordMessageCreate(user *User, msg *discordgo.Mess
+ 
+ 	var discordThreadID string
+ 	var threadRootEvent, lastThreadEvent id.EventID
++	// replyThreadID is only used for resolving reply targets, which is valid regardless
++	// of whether the message ends up recorded as part of the thread.
++	var replyThreadID string
+ 	if thread != nil {
++		replyThreadID = thread.ID
+ 		discordThreadID = thread.ID
+-		threadRootEvent = thread.RootMXID
+-		lastThreadEvent = threadRootEvent
+-		lastInThread := portal.bridge.DB.Message.GetLastInThread(portal.Key, thread.ID)
+-		if lastInThread != nil {
+-			lastThreadEvent = lastInThread.MXID
++		// Elect (or look up) the thread root. This either returns a root event that
++		// exists on the homeserver and is recorded in the thread row, or it fails
++		// immediately - it never blocks waiting for someone else to make progress.
++		root, err := thread.EnsureRoot(ctx)
++		if err != nil {
++			// No valid root: bridge the message to the main timeline and do NOT record
++			// it as part of the thread, so there's nothing to reconcile later. The next
++			// message for this thread will try the election again.
++			log.Warn().Err(err).
++				Str("thread_id", thread.ID).
++				Msg("No thread root available, bridging message without thread relation")
++		} else {
++			threadRootEvent = root
++			lastThreadEvent = root
++
++			lastInThread := portal.bridge.DB.Message.GetLastInThread(portal.Key, thread.ID)
++			if lastInThread != nil {
++				lastThreadEvent = lastInThread.MXID
++			}
+ 		}
+ 	}
+-	replyTo := portal.getReplyTarget(user, discordThreadID, msg.MessageReference, msg.Embeds, false)
++	replyTo := portal.getReplyTarget(user, replyThreadID, msg.MessageReference, msg.Embeds, false)
+ 	mentions := portal.convertDiscordMentions(msg, true)
+ 
+ 	ts, _ := discordgo.SnowflakeTimestamp(msg.ID)
+@@ -760,52 +778,6 @@ func (portal *Portal) getReplyTarget(source *User, threadID string, ref *discord
+ 
+ const JoinThreadReaction = "join thread"
+ 
+-func (portal *Portal) sendThreadCreationNotice(ctx context.Context, thread *Thread) {
+-	thread.creationNoticeLock.Lock()
+-	defer thread.creationNoticeLock.Unlock()
+-	if thread.CreationNoticeMXID != "" {
+-		return
+-	}
+-	creationNotice := "Thread created. React to this message with \"join thread\" to join the thread on Discord."
+-	if portal.bridge.Config.Bridge.AutojoinThreadOnOpen {
+-		creationNotice = "Thread created. Opening this thread will auto-join you to it on Discord."
+-	}
+-	log := zerolog.Ctx(ctx)
+-	resp, err := portal.sendMatrixMessage(portal.MainIntent(), event.EventMessage, &event.MessageEventContent{
+-		Body:      creationNotice,
+-		MsgType:   event.MsgNotice,
+-		RelatesTo: (&event.RelatesTo{}).SetThread(thread.RootMXID, thread.RootMXID),
+-	}, nil, time.Now().UnixMilli())
+-	if err != nil {
+-		log.Err(err).Msg("Failed to send thread creation notice")
+-		return
+-	}
+-	portal.bridge.threadsLock.Lock()
+-	thread.CreationNoticeMXID = resp.EventID
+-	portal.bridge.threadsByCreationNoticeMXID[resp.EventID] = thread
+-	portal.bridge.threadsLock.Unlock()
+-	thread.Update()
+-	log.Debug().
+-		Str("creation_notice_mxid", thread.CreationNoticeMXID.String()).
+-		Msg("Sent thread creation notice")
+-
+-	resp, err = portal.MainIntent().SendMessageEvent(portal.MXID, event.EventReaction, &event.ReactionEventContent{
+-		RelatesTo: event.RelatesTo{
+-			Type:    event.RelAnnotation,
+-			EventID: thread.CreationNoticeMXID,
+-			Key:     JoinThreadReaction,
+-		},
+-	})
+-	if err != nil {
+-		log.Err(err).Msg("Failed to send prefilled reaction to thread creation notice")
+-	} else {
+-		log.Debug().
+-			Str("reaction_event_id", resp.EventID.String()).
+-			Str("creation_notice_mxid", thread.CreationNoticeMXID.String()).
+-			Msg("Sent prefilled reaction to thread creation notice")
+-	}
+-}
+-
+ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Message) {
+ 	log := portal.log.With().
+ 		Str("message_id", msg.ID).
+@@ -2207,7 +2179,9 @@ func (portal *Portal) HandleMatrixReadReceipt(brUser bridge.User, eventID id.Eve
+ 		if portal.bridge.Config.Bridge.AutojoinThreadOnOpen {
+ 			thread.Join(sender)
+ 		}
+-		if eventID == thread.CreationNoticeMXID {
++		// Read the creation notice event ID under the thread's root lock. This must NOT
++		// call EnsureRoot: a read receipt never justifies creating a thread root.
++		if eventID == thread.CreationNoticeEventID() {
+ 			log.Debug().Msg("Dropping read receipt for thread creation notice")
+ 			return
+ 		}
+diff --git a/thread.go b/thread.go
+index 6e6aa7b..2b5a6e4 100644
+--- a/thread.go
++++ b/thread.go
+@@ -2,12 +2,15 @@ package main
+ 
+ import (
+ 	"context"
++	"errors"
++	"fmt"
+ 	"sync"
+ 	"time"
+ 
+ 	"github.com/bwmarrin/discordgo"
+ 	"github.com/rs/zerolog"
+ 	"golang.org/x/exp/slices"
++	"maunium.net/go/mautrix/event"
+ 	"maunium.net/go/mautrix/id"
+ 
+ 	"go.mau.fi/mautrix-discord/database"
+@@ -17,16 +20,231 @@ type Thread struct {
+ 	*database.Thread
+ 	Parent *Portal
+ 
+-	creationNoticeLock       sync.Mutex
++	// rootLock guards the thread root election performed by EnsureRoot, i.e. every
++	// read and write of RootMXID and CreationNoticeMXID. Those two fields are always
++	// written together as one logical transition, so they share one lock.
++	rootLock                 sync.Mutex
+ 	initialBackfillAttempted bool
+ }
+ 
++// ErrThreadParentNotBridged is returned by EnsureRoot when the thread's parent portal
++// does not exist yet or has no Matrix room. There is nothing to wait for in that case:
++// the caller decides what to do (usually: bridge the message to the main timeline
++// without recording it as part of the thread).
++var ErrThreadParentNotBridged = errors.New("thread parent portal is not bridged")
++
++// ErrThreadRootMissing is returned by EnsureRoot for a non-forum thread whose row has no
++// root message event. Normal threads are always created from an existing bridged root
++// message, so such a row is inconsistent and must not be self-rooted.
++var ErrThreadRootMissing = errors.New("thread row has no root event and is not a forum post")
++
++// EnsureRoot returns the Matrix event ID of this thread's root, electing (creating) it
++// if it doesn't exist yet.
++//
++// This is the single election point for a thread root: it is serialized by rootLock, so
++// exactly one caller ever sends the creation notice, and every caller returns with the
++// same event ID. When it returns a nil error, the returned event exists on the
++// homeserver and has been durably written to the thread row, so it is always safe to
++// send messages relating to it. When it returns an error, no thread state has been
++// modified and the caller must not mark its message as part of this thread.
++//
++// There is no waiting, no timeout and no background completion: the call either returns
++// a root immediately or performs the send inline and returns its result.
++func (thread *Thread) EnsureRoot(ctx context.Context) (id.EventID, error) {
++	thread.rootLock.Lock()
++	defer thread.rootLock.Unlock()
++
++	// Already elected: no I/O at all on this hot path.
++	if thread.RootMXID != "" {
++		return thread.RootMXID, nil
++	}
++	if !thread.IsForumPost {
++		return "", ErrThreadRootMissing
++	}
++	if thread.Parent == nil || thread.Parent.MXID == "" {
++		return "", ErrThreadParentNotBridged
++	}
++
++	// Forum posts have no pre-existing root message, so the creation notice itself is
++	// elected as the root: it is sent as a plain message with no thread relation, and
++	// the real event ID assigned by the homeserver becomes the thread anchor (MSC3440).
++	eventID, err := thread.sendCreationNotice(ctx)
++	if err != nil {
++		return "", err
++	}
++
++	prevRoot, prevNotice := thread.RootMXID, thread.CreationNoticeMXID
++	thread.RootMXID = eventID
++	thread.CreationNoticeMXID = eventID
++	if err = thread.saveMatrixIDs(); err != nil {
++		// Roll back the in-memory state so nothing suggests a successful election.
++		thread.RootMXID = prevRoot
++		thread.CreationNoticeMXID = prevNotice
++		return "", err
++	}
++
++	br := thread.Parent.bridge
++	br.threadsLock.Lock()
++	br.threadsByRootMXID[eventID] = thread
++	br.threadsByCreationNoticeMXID[eventID] = thread
++	br.threadsLock.Unlock()
++
++	zerolog.Ctx(ctx).Debug().
++		Str("thread_id", thread.ID).
++		Str("root_mxid", eventID.String()).
++		Msg("Elected forum post creation notice as thread root")
++
++	thread.sendJoinThreadReaction(ctx, eventID)
++	return eventID, nil
++}
++
++// EnsureCreationNotice sends the thread creation notice for a normal (non-forum) thread,
++// if it hasn't been sent yet. Unlike forum posts, normal threads already have a root
++// (the bridged root message), so the notice is a plain in-thread notice message and is
++// not part of root election: failing to send it never invalidates the thread.
++func (thread *Thread) EnsureCreationNotice(ctx context.Context) error {
++	thread.rootLock.Lock()
++	defer thread.rootLock.Unlock()
++
++	if thread.CreationNoticeMXID != "" {
++		return nil
++	}
++	if thread.IsForumPost {
++		// Forum posts get their notice from EnsureRoot, which also elects it as the root.
++		return nil
++	}
++	if thread.Parent == nil || thread.Parent.MXID == "" {
++		return ErrThreadParentNotBridged
++	}
++	if thread.RootMXID == "" {
++		return ErrThreadRootMissing
++	}
++
++	eventID, err := thread.sendCreationNotice(ctx)
++	if err != nil {
++		return err
++	}
++
++	prevNotice := thread.CreationNoticeMXID
++	thread.CreationNoticeMXID = eventID
++	if err = thread.saveMatrixIDs(); err != nil {
++		thread.CreationNoticeMXID = prevNotice
++		return err
++	}
++
++	br := thread.Parent.bridge
++	br.threadsLock.Lock()
++	br.threadsByCreationNoticeMXID[eventID] = thread
++	br.threadsLock.Unlock()
++
++	zerolog.Ctx(ctx).Debug().
++		Str("thread_id", thread.ID).
++		Str("creation_notice_mxid", eventID.String()).
++		Msg("Sent thread creation notice")
++
++	thread.sendJoinThreadReaction(ctx, eventID)
++	return nil
++}
++
++// sendCreationNotice sends the creation notice message for this thread and returns the
++// event ID the homeserver assigned to it. Must be called with rootLock held and with a
++// non-nil, bridged Parent.
++//
++// For forum posts the message is sent with NO thread relation, because its own event ID
++// is about to become the thread root. For normal threads it is sent inside the existing
++// thread, relating to the already-known root.
++func (thread *Thread) sendCreationNotice(ctx context.Context) (id.EventID, error) {
++	var creationNotice string
++	if thread.IsForumPost {
++		creationNotice = "Forum post created. React to this message with \"join thread\" to join the thread on Discord."
++		if thread.Parent.bridge.Config.Bridge.AutojoinThreadOnOpen {
++			creationNotice = "Forum post created. Opening this thread will auto-join you to it on Discord."
++		}
++	} else {
++		creationNotice = "Thread created. React to this message with \"join thread\" to join the thread on Discord."
++		if thread.Parent.bridge.Config.Bridge.AutojoinThreadOnOpen {
++			creationNotice = "Thread created. Opening this thread will auto-join you to it on Discord."
++		}
++	}
++	content := &event.MessageEventContent{
++		Body:    creationNotice,
++		MsgType: event.MsgNotice,
++	}
++	if !thread.IsForumPost {
++		content.RelatesTo = (&event.RelatesTo{}).SetThread(thread.RootMXID, thread.RootMXID)
++	}
++	resp, err := thread.Parent.sendMatrixMessage(thread.Parent.MainIntent(), event.EventMessage, content, nil, time.Now().UnixMilli())
++	if err != nil {
++		zerolog.Ctx(ctx).Err(err).Str("thread_id", thread.ID).Msg("Failed to send thread creation notice")
++		return "", fmt.Errorf("failed to send thread creation notice: %w", err)
++	}
++	return resp.EventID, nil
++}
++
++// sendJoinThreadReaction sends the prefilled "join thread" reaction to the creation
++// notice. Failures are logged and ignored: the reaction is only an affordance, the
++// thread itself is already fully bridged at this point.
++func (thread *Thread) sendJoinThreadReaction(ctx context.Context, noticeEventID id.EventID) {
++	log := zerolog.Ctx(ctx)
++	resp, err := thread.Parent.MainIntent().SendMessageEvent(thread.Parent.MXID, event.EventReaction, &event.ReactionEventContent{
++		RelatesTo: event.RelatesTo{
++			Type:    event.RelAnnotation,
++			EventID: noticeEventID,
++			Key:     JoinThreadReaction,
++		},
++	})
++	if err != nil {
++		log.Err(err).Msg("Failed to send prefilled reaction to thread creation notice")
++	} else {
++		log.Debug().
++			Str("reaction_event_id", resp.EventID.String()).
++			Str("creation_notice_mxid", noticeEventID.String()).
++			Msg("Sent prefilled reaction to thread creation notice")
++	}
++}
++
++// saveMatrixIDs persists RootMXID and CreationNoticeMXID in one statement, converting
++// the database layer's panic-on-error convention into an error so that the caller can
++// roll back its in-memory state instead of publishing a root that isn't in the database.
++func (thread *Thread) saveMatrixIDs() (err error) {
++	defer func() {
++		if r := recover(); r != nil {
++			err = fmt.Errorf("failed to save thread Matrix IDs: %v", r)
++		}
++	}()
++	thread.Thread.UpdateMatrixIDs()
++	return nil
++}
++
++// CreationNoticeEventID returns the creation notice event ID under the root lock.
++// Used by readers that only want to identify the notice event and must never trigger
++// an election (e.g. the read receipt handler).
++func (thread *Thread) CreationNoticeEventID() id.EventID {
++	thread.rootLock.Lock()
++	defer thread.rootLock.Unlock()
++	return thread.CreationNoticeMXID
++}
++
+ func (br *DiscordBridge) GetThreadByID(id string, root *database.Message) *Thread {
+ 	br.threadsLock.Lock()
+ 	defer br.threadsLock.Unlock()
+ 	thread, ok := br.threadsByID[id]
+ 	if !ok {
+-		return br.loadThread(br.DB.Thread.GetByDiscordID(id), id, root)
++		return br.loadThread(br.DB.Thread.GetByDiscordID(id), id, root, "")
++	}
++	return thread
++}
++
++// GetForumPostThread retrieves or creates the Thread for a forum post, which has no root
++// message. The root event itself is not created here; it is elected lazily by EnsureRoot.
++// Returns nil if the thread row cannot be created (e.g. the parent portal doesn't exist).
++func (br *DiscordBridge) GetForumPostThread(forumPostThreadID string, parentChannelID string) *Thread {
++	br.threadsLock.Lock()
++	defer br.threadsLock.Unlock()
++	thread, ok := br.threadsByID[forumPostThreadID]
++	if !ok {
++		// Note: may return nil if the parent portal doesn't exist; nil is never cached.
++		return br.loadThread(br.DB.Thread.GetByDiscordID(forumPostThreadID), forumPostThreadID, nil, parentChannelID)
+ 	}
+ 	return thread
+ }
+@@ -36,7 +254,7 @@ func (br *DiscordBridge) GetThreadByRootMXID(mxid id.EventID) *Thread {
+ 	defer br.threadsLock.Unlock()
+ 	thread, ok := br.threadsByRootMXID[mxid]
+ 	if !ok {
+-		return br.loadThread(br.DB.Thread.GetByMatrixRootMsg(mxid), "", nil)
++		return br.loadThread(br.DB.Thread.GetByMatrixRootMsg(mxid), "", nil, "")
+ 	}
+ 	return thread
+ }
+@@ -48,30 +266,64 @@ func (br *DiscordBridge) GetThreadByRootOrCreationNoticeMXID(mxid id.EventID) *T
+ 	if !ok {
+ 		thread, ok = br.threadsByCreationNoticeMXID[mxid]
+ 		if !ok {
+-			return br.loadThread(br.DB.Thread.GetByMatrixRootOrCreationNoticeMsg(mxid), "", nil)
++			return br.loadThread(br.DB.Thread.GetByMatrixRootOrCreationNoticeMsg(mxid), "", nil, "")
+ 		}
+ 	}
+ 	return thread
+ }
+ 
+-func (br *DiscordBridge) loadThread(dbThread *database.Thread, id string, root *database.Message) *Thread {
++// loadThread is the single constructor for Thread objects. It wraps an existing database
++// row, or creates one, and publishes the result into the bridge's thread maps.
++//
++// When dbThread is nil, a new row is inserted based on exactly one of:
++//   - root != nil: a normal thread, rooted at an already-bridged Matrix message.
++//   - forumPostParentID != "": a freshly discovered forum post. It has no root message;
++//     RootMXID stays empty until EnsureRoot elects the creation notice as the root.
++//
++// If neither is given, there is nothing to create and nil is returned.
++//
++// Must be called with br.threadsLock held.
++func (br *DiscordBridge) loadThread(dbThread *database.Thread, threadID string, root *database.Message, forumPostParentID string) *Thread {
+ 	if dbThread == nil {
+-		if root == nil {
++		var parentID, rootDiscordID string
++		var rootMXID id.EventID
++		var isForumPost bool
++		switch {
++		case root != nil:
++			parentID = root.Channel.ChannelID
++			rootDiscordID = root.DiscordID
++			rootMXID = root.MXID
++		case forumPostParentID != "":
++			parentID = forumPostParentID
++			// Forum posts are their own root on the Discord side.
++			rootDiscordID = threadID
++			isForumPost = true
++		default:
++			return nil
++		}
++		// The thread row has a foreign key to the parent portal, so inserting before the
++		// portal exists would fail the constraint (and panic in the database layer).
++		// Bail out instead and let the caller handle the missing parent.
++		if br.GetExistingPortalByID(database.NewPortalKey(parentID, "")) == nil {
+ 			return nil
+ 		}
+ 		dbThread = br.DB.Thread.New()
+-		dbThread.ID = id
+-		dbThread.RootDiscordID = root.DiscordID
+-		dbThread.RootMXID = root.MXID
+-		dbThread.ParentID = root.Channel.ChannelID
++		dbThread.ID = threadID
++		dbThread.ParentID = parentID
++		dbThread.RootDiscordID = rootDiscordID
++		dbThread.RootMXID = rootMXID
++		dbThread.IsForumPost = isForumPost
+ 		dbThread.Insert()
+ 	}
+-	thread := &Thread{
+-		Thread: dbThread,
+-	}
++	thread := &Thread{Thread: dbThread}
++	// Always resolve the parent from the row itself, so it matches what's in the database
++	// rather than whatever the caller passed in.
+ 	thread.Parent = br.GetExistingPortalByID(database.NewPortalKey(thread.ParentID, ""))
++
+ 	br.threadsByID[thread.ID] = thread
+-	br.threadsByRootMXID[thread.RootMXID] = thread
++	if thread.RootMXID != "" {
++		br.threadsByRootMXID[thread.RootMXID] = thread
++	}
+ 	if thread.CreationNoticeMXID != "" {
+ 		br.threadsByCreationNoticeMXID[thread.CreationNoticeMXID] = thread
+ 	}
+@@ -81,17 +333,67 @@ func (br *DiscordBridge) loadThread(dbThread *database.Thread, id string, root *
+ func (br *DiscordBridge) threadFound(ctx context.Context, source *User, rootMessage *database.Message, id string, metadata *discordgo.Channel) {
+ 	thread := br.GetThreadByID(id, rootMessage)
+ 	log := zerolog.Ctx(ctx)
++	if thread == nil {
++		log.Warn().
++			Str("thread_id", id).
++			Msg("Cannot create thread: parent portal not found")
++		return
++	}
+ 	log.Debug().Msg("Marked message as thread root")
+-	if thread.CreationNoticeMXID == "" {
+-		thread.Parent.sendThreadCreationNotice(ctx, thread)
++	if err := thread.EnsureCreationNotice(ctx); err != nil {
++		log.Warn().Err(err).Str("thread_id", id).Msg("Failed to send thread creation notice")
+ 	}
+ 	// TODO member_ids_preview is probably not guaranteed to contain the source user
+-	if source != nil && metadata != nil && slices.Contains(metadata.MemberIDsPreview, source.DiscordID) && !source.IsInPortal(thread.ID) {
++	// Skip entirely if thread.Parent is nil - maybeInitialBackfill dereferences it, which
++	// would panic in the spawned goroutine (no recover there).
++	if thread.Parent != nil && source != nil && metadata != nil && slices.Contains(metadata.MemberIDsPreview, source.DiscordID) && !source.IsInPortal(thread.ID) {
++		source.MarkInPortal(database.UserPortal{
++			DiscordID: thread.ID,
++			Type:      database.UserPortalTypeThread,
++			Timestamp: time.Now(),
++		})
++		if metadata.MessageCount > 0 {
++			go thread.maybeInitialBackfill(source)
++		} else {
++			thread.initialBackfillAttempted = true
++		}
++	}
++}
++
++// forumPostFound is called when a forum post (a thread with no pre-existing root message)
++// is discovered. It makes sure a Thread row exists and eagerly elects the root, so that
++// live posts show up promptly. Root election is not required to succeed here: if it
++// fails, the next message that needs the root elects it via EnsureRoot.
++func (br *DiscordBridge) forumPostFound(ctx context.Context, source *User, forumPostThreadID string, parentChannelID string, metadata *discordgo.Channel) {
++	thread := br.GetForumPostThread(forumPostThreadID, parentChannelID)
++	log := zerolog.Ctx(ctx)
++	log.Debug().Msg("Discovered forum post thread")
++
++	if thread == nil {
++		log.Warn().
++			Str("thread_id", forumPostThreadID).
++			Str("parent_id", parentChannelID).
++			Msg("Cannot create forum post thread: parent portal not found")
++		return
++	}
++
++	if _, err := thread.EnsureRoot(ctx); err != nil {
++		log.Warn().Err(err).
++			Str("thread_id", forumPostThreadID).
++			Str("parent_id", parentChannelID).
++			Msg("Failed to create forum post thread root, will retry when a message needs it")
++	}
++
++	// Auto-join the source user if they're in the post's member list and haven't joined yet.
++	// Skip entirely if thread.Parent is nil - maybeInitialBackfill dereferences it, which
++	// would panic in the spawned goroutine (no recover there).
++	if thread.Parent != nil && source != nil && metadata != nil && slices.Contains(metadata.MemberIDsPreview, source.DiscordID) && !source.IsInPortal(thread.ID) {
+ 		source.MarkInPortal(database.UserPortal{
+ 			DiscordID: thread.ID,
+ 			Type:      database.UserPortalTypeThread,
+ 			Timestamp: time.Now(),
+ 		})
++		// Note: forum posts might have different backfill behavior; respect the config
+ 		if metadata.MessageCount > 0 {
+ 			go thread.maybeInitialBackfill(source)
+ 		} else {
+diff --git a/thread_test.go b/thread_test.go
+new file mode 100644
+index 0000000..620f370
+--- /dev/null
++++ b/thread_test.go
+@@ -0,0 +1,486 @@
++package main
++
++import (
++	"context"
++	"database/sql"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/rs/zerolog"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.mau.fi/util/dbutil"
++	"maunium.net/go/maulogger/v2"
++	"maunium.net/go/mautrix/appservice"
++	"maunium.net/go/mautrix/bridge"
++	"maunium.net/go/mautrix/id"
++
++	"go.mau.fi/mautrix-discord/config"
++	"go.mau.fi/mautrix-discord/database"
++	"go.mau.fi/mautrix-discord/database/upgrades"
++)
++
++// fakeHomeserver is a minimal Matrix homeserver stub. It accepts every request and
++// counts the m.room.message sends, so tests can assert how many creation notices were
++// actually sent. Each send gets a unique event ID.
++type fakeHomeserver struct {
++	server *httptest.Server
++
++	messageSends atomic.Int64
++	eventCounter atomic.Int64
++
++	// failSends makes every m.room.message send return a 500.
++	failSends atomic.Bool
++}
++
++func newFakeHomeserver(t *testing.T) *fakeHomeserver {
++	t.Helper()
++	hs := &fakeHomeserver{}
++	hs.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch {
++		case strings.Contains(r.URL.Path, "/send/m.room.message/"):
++			if hs.failSends.Load() {
++				w.WriteHeader(http.StatusInternalServerError)
++				_, _ = fmt.Fprint(w, `{"errcode":"M_UNKNOWN","error":"nope"}`)
++				return
++			}
++			hs.messageSends.Add(1)
++			n := hs.eventCounter.Add(1)
++			_, _ = fmt.Fprintf(w, `{"event_id":"$evt%d:test"}`, n)
++		case strings.Contains(r.URL.Path, "/send/"):
++			n := hs.eventCounter.Add(1)
++			_, _ = fmt.Fprintf(w, `{"event_id":"$evt%d:test"}`, n)
++		default:
++			// join, typing, register, ...
++			_, _ = fmt.Fprint(w, `{}`)
++		}
++	}))
++	t.Cleanup(hs.server.Close)
++	return hs
++}
++
++// testBridge builds a DiscordBridge wired to a real (temporary sqlite) database and the
++// fake homeserver, with just enough of the bridge initialized for thread root election.
++type testBridge struct {
++	br *DiscordBridge
++	hs *fakeHomeserver
++	db *database.Database
++}
++
++func newTestBridge(t *testing.T) *testBridge {
++	t.Helper()
++	hs := newFakeHomeserver(t)
++
++	rawDB, err := dbutil.NewWithDialect("file:"+filepath.Join(t.TempDir(), "test.db")+"?_foreign_keys=on", "sqlite3")
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = rawDB.Close() })
++	rawDB.Log = dbutil.NoopLogger
++	db := database.New(rawDB, maulogger.Create())
++	require.NoError(t, db.Upgrade())
++
++	as := appservice.Create()
++	as.Registration = appservice.CreateRegistration()
++	as.Registration.SenderLocalpart = "discordbot"
++	as.HomeserverDomain = "test"
++	require.NoError(t, as.SetHomeserverURL(hs.server.URL))
++
++	nopLog := zerolog.Nop()
++	br := &DiscordBridge{
++		Bridge: bridge.Bridge{
++			AS:   as,
++			Bot:  as.BotIntent(),
++			ZLog: &nopLog,
++		},
++		Config: &config.Config{},
++		DB:     db,
++
++		portalsByID:   make(map[database.PortalKey]*Portal),
++		portalsByMXID: make(map[id.RoomID]*Portal),
++
++		threadsByID:                 make(map[string]*Thread),
++		threadsByRootMXID:           make(map[id.EventID]*Thread),
++		threadsByCreationNoticeMXID: make(map[id.EventID]*Thread),
++	}
++	return &testBridge{br: br, hs: hs, db: db}
++}
++
++// makePortal inserts a portal row and registers an in-memory Portal for it.
++// If roomID is empty the portal exists but is not bridged to a Matrix room.
++func (tb *testBridge) makePortal(t *testing.T, channelID string, roomID id.RoomID) *Portal {
++	t.Helper()
++	dbPortal := tb.db.Portal.New()
++	dbPortal.Key = database.NewPortalKey(channelID, "")
++	dbPortal.MXID = roomID
++	dbPortal.Insert()
++	portal := &Portal{
++		Portal: dbPortal,
++		bridge: tb.br,
++		log:    zerolog.Nop(),
++	}
++	tb.br.portalsByID[dbPortal.Key] = portal
++	if roomID != "" {
++		tb.br.portalsByMXID[roomID] = portal
++	}
++	return portal
++}
++
++func testCtx() context.Context {
++	return zerolog.Nop().WithContext(context.Background())
++}
++
++// TestEnsureRootConcurrent is the central regression test for the thread root election:
++// many goroutines race to get the root of the same fresh forum post, and exactly one
++// creation notice must be sent while every caller gets that same event ID back.
++func TestEnsureRootConcurrent(t *testing.T) {
++	tb := newTestBridge(t)
++	tb.makePortal(t, "parentchan", "!room:test")
++
++	thread := tb.br.GetForumPostThread("forumpost", "parentchan")
++	require.NotNil(t, thread)
++	require.True(t, thread.IsForumPost)
++	require.Empty(t, thread.RootMXID)
++
++	const goroutines = 32
++	results := make([]id.EventID, goroutines)
++	errs := make([]error, goroutines)
++	var start sync.WaitGroup
++	var done sync.WaitGroup
++	start.Add(1)
++	for i := 0; i < goroutines; i++ {
++		done.Add(1)
++		go func(i int) {
++			defer done.Done()
++			start.Wait()
++			results[i], errs[i] = thread.EnsureRoot(testCtx())
++		}(i)
++	}
++	start.Done()
++	done.Wait()
++
++	for i := 0; i < goroutines; i++ {
++		require.NoError(t, errs[i], "goroutine %d", i)
++		assert.NotEmpty(t, results[i], "goroutine %d got an empty root", i)
++		assert.Equal(t, results[0], results[i], "goroutine %d got a different root", i)
++	}
++	assert.EqualValues(t, 1, tb.hs.messageSends.Load(), "exactly one creation notice must be sent")
++
++	root := results[0]
++	assert.Equal(t, root, thread.RootMXID)
++	assert.Equal(t, root, thread.CreationNoticeMXID)
++
++	// The root must be durably recorded in the thread row before anything relates to it.
++	reloaded := tb.db.Thread.GetByDiscordID("forumpost")
++	require.NotNil(t, reloaded)
++	assert.Equal(t, root, reloaded.RootMXID)
++	assert.Equal(t, root, reloaded.CreationNoticeMXID)
++	assert.True(t, reloaded.IsForumPost)
++
++	// And registered in the lookup maps.
++	assert.Same(t, thread, tb.br.GetThreadByRootMXID(root))
++	assert.Same(t, thread, tb.br.GetThreadByRootOrCreationNoticeMXID(root))
++
++	// A later call is a pure memoized read: no further sends.
++	again, err := thread.EnsureRoot(testCtx())
++	require.NoError(t, err)
++	assert.Equal(t, root, again)
++	assert.EqualValues(t, 1, tb.hs.messageSends.Load())
++}
++
++// TestEnsureRootSendFailure checks that a failed send leaves no state suggesting success
++// and that a later call can still elect a root.
++func TestEnsureRootSendFailure(t *testing.T) {
++	tb := newTestBridge(t)
++	tb.makePortal(t, "parentchan", "!room:test")
++	tb.hs.failSends.Store(true)
++
++	thread := tb.br.GetForumPostThread("forumpost", "parentchan")
++	require.NotNil(t, thread)
++
++	root, err := thread.EnsureRoot(testCtx())
++	require.Error(t, err)
++	assert.Empty(t, root)
++	assert.Empty(t, thread.RootMXID)
++	assert.Empty(t, thread.CreationNoticeMXID)
++	assert.Empty(t, tb.db.Thread.GetByDiscordID("forumpost").RootMXID)
++	assert.Empty(t, tb.br.threadsByRootMXID)
++
++	// Recovery: once sends work again, the next caller elects the root.
++	tb.hs.failSends.Store(false)
++	root, err = thread.EnsureRoot(testCtx())
++	require.NoError(t, err)
++	assert.NotEmpty(t, root)
++	assert.Equal(t, root, tb.db.Thread.GetByDiscordID("forumpost").RootMXID)
++}
++
++// TestEnsureRootErrors covers the non-sending outcomes: EnsureRoot must return
++// immediately with an error rather than waiting for anything.
++func TestEnsureRootErrors(t *testing.T) {
++	tests := []struct {
++		name string
++		// setup returns the thread to test
++		setup   func(t *testing.T, tb *testBridge) *Thread
++		wantErr error
++	}{
++		{
++			name: "parent portal has no Matrix room",
++			setup: func(t *testing.T, tb *testBridge) *Thread {
++				tb.makePortal(t, "parentchan", "")
++				thread := tb.br.GetForumPostThread("forumpost", "parentchan")
++				require.NotNil(t, thread)
++				return thread
++			},
++			wantErr: ErrThreadParentNotBridged,
++		},
++		{
++			name: "parent portal object missing",
++			setup: func(t *testing.T, tb *testBridge) *Thread {
++				tb.makePortal(t, "parentchan", "!room:test")
++				thread := tb.br.GetForumPostThread("forumpost", "parentchan")
++				require.NotNil(t, thread)
++				thread.Parent = nil
++				return thread
++			},
++			wantErr: ErrThreadParentNotBridged,
++		},
++		{
++			name: "non-forum thread without a root event",
++			setup: func(t *testing.T, tb *testBridge) *Thread {
++				tb.makePortal(t, "parentchan", "!room:test")
++				dbThread := tb.db.Thread.New()
++				dbThread.ID = "plainthread"
++				dbThread.ParentID = "parentchan"
++				dbThread.RootDiscordID = "rootmsg"
++				dbThread.Insert()
++				return tb.br.GetThreadByID("plainthread", nil)
++			},
++			wantErr: ErrThreadRootMissing,
++		},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			tb := newTestBridge(t)
++			thread := test.setup(t, tb)
++			require.NotNil(t, thread)
++
++			root, err := thread.EnsureRoot(testCtx())
++			assert.ErrorIs(t, err, test.wantErr)
++			assert.Empty(t, root)
++			assert.Zero(t, tb.hs.messageSends.Load(), "nothing may be sent on an error path")
++		})
++	}
++}
++
++// TestLoadThreadConstructor covers the single merged constructor: both creation modes,
++// the FK guard, and the "nothing to create" case.
++func TestLoadThreadConstructor(t *testing.T) {
++	t.Run("forum post insert sets the discriminator", func(t *testing.T) {
++		tb := newTestBridge(t)
++		tb.makePortal(t, "parentchan", "!room:test")
++
++		thread := tb.br.GetForumPostThread("forumpost", "parentchan")
++		require.NotNil(t, thread)
++		assert.True(t, thread.IsForumPost)
++		assert.Empty(t, thread.RootMXID)
++		assert.Equal(t, "forumpost", thread.RootDiscordID)
++		assert.Same(t, thread, tb.br.GetThreadByID("forumpost", nil), "must be cached")
++
++		stored := tb.db.Thread.GetByDiscordID("forumpost")
++		require.NotNil(t, stored)
++		assert.True(t, stored.IsForumPost, "IsForumPost must be persisted, not re-derived")
++	})
++
++	t.Run("normal thread insert from a root message", func(t *testing.T) {
++		tb := newTestBridge(t)
++		tb.makePortal(t, "parentchan", "!room:test")
++
++		rootMsg := &database.Message{
++			DiscordID: "rootmsg",
++			Channel:   database.NewPortalKey("parentchan", ""),
++			MXID:      "$root:test",
++		}
++		thread := tb.br.GetThreadByID("plainthread", rootMsg)
++		require.NotNil(t, thread)
++		assert.False(t, thread.IsForumPost)
++		assert.EqualValues(t, "$root:test", thread.RootMXID)
++		assert.Same(t, thread, tb.br.GetThreadByRootMXID("$root:test"))
++
++		stored := tb.db.Thread.GetByDiscordID("plainthread")
++		require.NotNil(t, stored)
++		assert.False(t, stored.IsForumPost)
++
++		// An already-rooted thread needs no election and no I/O.
++		root, err := thread.EnsureRoot(testCtx())
++		require.NoError(t, err)
++		assert.EqualValues(t, "$root:test", root)
++		assert.Zero(t, tb.hs.messageSends.Load())
++	})
++
++	t.Run("no parent portal means no insert", func(t *testing.T) {
++		tb := newTestBridge(t)
++		// No portal for "parentchan" at all: inserting would violate the foreign key.
++		assert.Nil(t, tb.br.GetForumPostThread("forumpost", "parentchan"))
++		assert.Nil(t, tb.db.Thread.GetByDiscordID("forumpost"))
++		assert.Empty(t, tb.br.threadsByID, "nil threads must not be cached")
++	})
++
++	t.Run("nothing to create", func(t *testing.T) {
++		tb := newTestBridge(t)
++		assert.Nil(t, tb.br.GetThreadByID("nonexistent", nil))
++		assert.Nil(t, tb.br.GetThreadByRootMXID("$nonexistent:test"))
++	})
++}
++
++// TestIsForumPostMigration verifies the v25 migration backfills the discriminator for
++// rows written by the old code, which only ever left root_msg_mxid empty for forum posts.
++func TestIsForumPostMigration(t *testing.T) {
++	dbPath := filepath.Join(t.TempDir(), "migrate.db")
++
++	// Build a v24-era database and insert one forum-post-shaped and one normal row.
++	rawDB, err := sql.Open("sqlite3", "file:"+dbPath)
++	require.NoError(t, err)
++	old, err := dbutil.NewWithDB(rawDB, "sqlite3")
++	require.NoError(t, err)
++	old.Log = dbutil.NoopLogger
++	old.UpgradeTable = truncatedUpgradeTable(t, 24)
++	require.NoError(t, old.Upgrade())
++	for _, q := range []string{
++		`INSERT INTO portal (dcid, receiver, type, plain_name, name, name_set, topic, topic_set, avatar, avatar_url, avatar_set, encrypted, first_event_id, friend_nick, in_space) VALUES ('parentchan', '', 0, '', '', false, '', false, '', '', false, false, '', false, '')`,
++		`INSERT INTO thread (dcid, parent_chan_id, root_msg_dcid, root_msg_mxid, creation_notice_mxid) VALUES ('forumpost', 'parentchan', 'forumpost', '', '')`,
++		`INSERT INTO thread (dcid, parent_chan_id, root_msg_dcid, root_msg_mxid, creation_notice_mxid) VALUES ('plainthread', 'parentchan', 'rootmsg', '$root:test', '')`,
++	} {
++		_, err = old.Exec(q)
++		require.NoError(t, err, q)
++	}
++	require.NoError(t, old.Close())
++
++	// Reopen with the full upgrade table, running the new migration.
++	newRawDB, err := dbutil.NewWithDialect("file:"+dbPath, "sqlite3")
++	require.NoError(t, err)
++	newRawDB.Log = dbutil.NoopLogger
++	db := database.New(newRawDB, maulogger.Create())
++	require.NoError(t, db.Upgrade())
++	t.Cleanup(func() { _ = newRawDB.Close() })
++
++	forumPost := db.Thread.GetByDiscordID("forumpost")
++	require.NotNil(t, forumPost)
++	assert.True(t, forumPost.IsForumPost)
++
++	plain := db.Thread.GetByDiscordID("plainthread")
++	require.NotNil(t, plain)
++	assert.False(t, plain.IsForumPost)
++}
++
++// truncatedUpgradeTable returns the bridge's upgrade table cut off after version `to`,
++// so a test can build a database as it looked before a later migration.
++func truncatedUpgradeTable(t *testing.T, to int) dbutil.UpgradeTable {
++	t.Helper()
++	full := upgrades.Table
++	require.Greater(t, len(full), to, "upgrade table should have more entries than v%d", to)
++	return full[:to]
++}
++
++// TestNoStallOnMissingRoot is the regression test for the behaviour of the old
++// completion-barrier mechanism this replaced: a forum post row with no root reached
++// through the message handling path blocked for five seconds. EnsureRoot must always
++// answer promptly.
++func TestNoStallOnMissingRoot(t *testing.T) {
++	tb := newTestBridge(t)
++	// Portal exists but has no Matrix room, so no root can be elected.
++	tb.makePortal(t, "parentchan", "")
++	thread := tb.br.GetForumPostThread("forumpost", "parentchan")
++	require.NotNil(t, thread)
++
++	done := make(chan error, 1)
++	go func() {
++		_, err := thread.EnsureRoot(testCtx())
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		assert.ErrorIs(t, err, ErrThreadParentNotBridged)
++	case <-time.After(time.Second):
++		t.Fatal("EnsureRoot blocked instead of returning immediately")
++	}
++}
++
++// TestDiscordThreadIDRecordedOnEnsureRootFailure verifies that even when EnsureRoot
++// fails (e.g. parent portal has no Matrix room), discordThreadID is still recorded in the
++// message database so that future edits, reactions, and redactions can be routed to the
++// Discord thread channel instead of the parent channel. This is the regression test for N1:
++// blanking discordThreadID breaks Discord-side routing for that message.
++func TestDiscordThreadIDRecordedOnEnsureRootFailure(t *testing.T) {
++	tb := newTestBridge(t)
++	// Parent portal exists but is NOT bridged to a Matrix room, so EnsureRoot will fail.
++	tb.makePortal(t, "parentchan", "")
++
++	// Thread for a forum post in that parent channel.
++	thread := tb.br.GetForumPostThread("forumpost", "parentchan")
++	require.NotNil(t, thread)
++
++	// Verify EnsureRoot actually fails with the expected error.
++	_, err := thread.EnsureRoot(testCtx())
++	require.Error(t, err)
++	require.Equal(t, ErrThreadParentNotBridged, err)
++
++	// The key test: even though EnsureRoot failed, we still need to record the
++	// discordThreadID in the database. Simulate what handleDiscordMessageCreate does.
++	portal := tb.br.portalsByID[database.NewPortalKey("parentchan", "")]
++	require.NotNil(t, portal)
++
++	// Create a message record with the thread ID set (this is what the fix ensures).
++	// Before the fix, this would have been empty because discordThreadID = thread.ID
++	// was gated on EnsureRoot success.
++	messagePart := database.MessagePart{
++		AttachmentID: "",
++		MXID:         "$evt1:test",
++	}
++
++	dbMsg := portal.markMessageHandled(
++		"test_message_123",
++		"test_author_456",
++		time.UnixMilli(1234567890),
++		thread.ID, // The fix ensures this is set unconditionally, not just on EnsureRoot success
++		"@testbot:test",
++		[]database.MessagePart{messagePart},
++	)
++	require.NotNil(t, dbMsg)
++
++	// The critical assertion: ThreadID must be set even though EnsureRoot failed.
++	assert.Equal(t, thread.ID, dbMsg.ThreadID, "ThreadID must be recorded even when EnsureRoot fails")
++
++	// Verify it's also persisted to the database.
++	reloaded := tb.db.Message.GetFirstByDiscordID(portal.Key, "test_message_123")
++	require.NotNil(t, reloaded)
++	assert.Equal(t, thread.ID, reloaded.ThreadID, "ThreadID must be persisted to database")
++
++	// Verify that DiscordProtoChannelID() correctly returns the thread ID, not the parent.
++	assert.Equal(t, thread.ID, reloaded.DiscordProtoChannelID(), "DiscordProtoChannelID must resolve to the thread, not the parent channel")
++}
++
++// TestDiscordThreadIDRoutingCorrect verifies that DiscordProtoChannelID correctly uses
++// ThreadID when set, falling back to the channel only when ThreadID is empty.
++func TestDiscordThreadIDRoutingCorrect(t *testing.T) {
++	t.Run("message in thread", func(t *testing.T) {
++		msg := &database.Message{
++			Channel:  database.NewPortalKey("parentchan", ""),
++			ThreadID: "threadid123",
++		}
++		assert.Equal(t, "threadid123", msg.DiscordProtoChannelID())
++	})
++
++	t.Run("message in main channel", func(t *testing.T) {
++		msg := &database.Message{
++			Channel:  database.NewPortalKey("parentchan", ""),
++			ThreadID: "",
++		}
++		assert.Equal(t, "parentchan", msg.DiscordProtoChannelID())
++	})
++}
+diff --git a/user.go b/user.go
+index 8c0d6ec..49c6afa 100644
+--- a/user.go
++++ b/user.go
+@@ -723,6 +723,8 @@ func (user *User) eventHandler(rawEvt any) {
+ 		user.interactionSuccessHandler(evt)
+ 	case *discordgo.ThreadListSync:
+ 		user.threadListSyncHandler(evt)
++	case *discordgo.ThreadCreate:
++		user.threadCreateHandler(evt)
+ 	case *discordgo.Event:
+ 		// Ignore
+ 	default:
+@@ -1134,25 +1136,135 @@ func (user *User) guildUpdateHandler(g *discordgo.GuildUpdate) {
+ 
+ func (user *User) threadListSyncHandler(t *discordgo.ThreadListSync) {
+ 	for _, meta := range t.Threads {
+-		log := user.log.With().
+-			Str("action", "thread list sync").
+-			Str("guild_id", t.GuildID).
+-			Str("parent_id", meta.ParentID).
+-			Str("thread_id", meta.ID).
+-			Logger()
+-		ctx := log.WithContext(context.Background())
+-		thread := user.bridge.GetThreadByID(meta.ID, nil)
+-		if thread == nil {
+-			msg := user.bridge.DB.Message.GetByDiscordID(database.NewPortalKey(meta.ParentID, ""), meta.ID)
+-			if len(msg) == 0 {
+-				log.Debug().Msg("Found unknown thread in thread list sync and don't have message")
++		// Capture thread ID and parent ID before entering closure to avoid dereferencing nil in recover handler.
++		// Check for nil BEFORE dereferencing meta.ID/meta.ParentID, not after.
++		var threadID, parentID string
++		if meta == nil {
++			threadID = "<nil>"
++			parentID = "<nil>"
++		} else {
++			threadID = meta.ID
++			parentID = meta.ParentID
++		}
++		// Wrap each thread processing in its own panic recovery so one bad thread
++		// doesn't abandon processing of the remaining threads in this batch.
++		func(threadMeta *discordgo.Channel) {
++			defer func() {
++				if r := recover(); r != nil {
++					user.log.Error().
++						Str("action", "thread list sync").
++						Str("guild_id", t.GuildID).
++						Str("parent_id", parentID).
++						Str("thread_id", threadID).
++						Interface("panic", r).
++						Msg("Panic processing thread in batch, continuing to next thread")
++				}
++			}()
++
++			// Skip nil elements cleanly without dereferencing
++			if threadMeta == nil {
++				return
++			}
++
++			log := user.log.With().
++				Str("action", "thread list sync").
++				Str("guild_id", t.GuildID).
++				Str("parent_id", threadMeta.ParentID).
++				Str("thread_id", threadMeta.ID).
++				Logger()
++			ctx := log.WithContext(context.Background())
++			thread := user.bridge.GetThreadByID(threadMeta.ID, nil)
++			if thread == nil {
++				msg := user.bridge.DB.Message.GetByDiscordID(database.NewPortalKey(threadMeta.ParentID, ""), threadMeta.ID)
++				if len(msg) == 0 {
++					// No message found. Check if this is a forum post (forum posts never have a root message).
++					// If the parent channel is a forum, treat this as a forum post discovery.
++					parentChannel, err := user.Session.State.Channel(threadMeta.ParentID)
++					if err != nil || parentChannel == nil {
++						log.Warn().Err(err).Msg("Parent channel not found in state, skipping thread list sync entry")
++					} else if parentChannel.Type == discordgo.ChannelTypeGuildForum || parentChannel.Type == discordgo.ChannelTypeGuildMedia {
++						if user.getGuildBridgingMode(t.GuildID) < database.GuildBridgeEverything {
++							log.Debug().
++								Str("guild_id", t.GuildID).
++								Msg("Ignoring forum post thread in unbridged guild")
++						} else {
++							log.Debug().Msg("Found unknown forum post thread in thread list sync, auto-bridging")
++							user.bridge.forumPostFound(ctx, user, threadMeta.ID, threadMeta.ParentID, threadMeta)
++						}
++					} else {
++						log.Debug().Msg("Found unknown thread in thread list sync and don't have message")
++					}
++				} else {
++					log.Debug().Msg("Found unknown thread in thread list sync for existing message, creating thread")
++					user.bridge.threadFound(ctx, user, msg[0], threadMeta.ID, threadMeta)
++				}
+ 			} else {
+-				log.Debug().Msg("Found unknown thread in thread list sync for existing message, creating thread")
+-				user.bridge.threadFound(ctx, user, msg[0], meta.ID, meta)
++				// An existing thread row was found. There is no "half-bridged" state to
++				// resume: if the thread has no root yet, EnsureRoot creates one lazily
++				// the next time a message needs it.
++				if thread.Parent == nil {
++					log.Debug().Msg("Existing thread has no bridged parent portal, skipping backfill")
++				} else {
++					thread.Parent.ForwardBackfillMissed(user, threadMeta.LastMessageID, thread)
++				}
+ 			}
++		}(meta)
++	}
++}
++
++// threadCreateHandler processes THREAD_CREATE gateway events.
++// This handles both normal channel threads and forum post threads.
++func (user *User) threadCreateHandler(t *discordgo.ThreadCreate) {
++	// CRITICAL: Check t.Channel == nil FIRST, before any field access on t
++	// (including t.GuildID). Since discordgo.ThreadCreate embeds *Channel by pointer,
++	// all promoted field reads (t.GuildID, t.ParentID, etc.) dereference that pointer.
++	if t.Channel == nil {
++		user.log.Warn().Msg("ThreadCreate event has nil Channel, skipping")
++		return
++	}
++
++	if user.getGuildBridgingMode(t.GuildID) < database.GuildBridgeEverything {
++		user.log.Debug().
++			Str("guild_id", t.GuildID).Str("thread_id", t.ID).
++			Msg("Ignoring thread create event in unbridged guild")
++		return
++	}
++
++	log := user.log.With().
++		Str("action", "thread create").
++		Str("guild_id", t.GuildID).
++		Str("parent_id", t.ParentID).
++		Str("thread_id", t.ID).
++		Str("thread_type", fmt.Sprintf("%d", t.Type)).
++		Logger()
++	ctx := log.WithContext(context.Background())
++
++	// Determine if this is a forum post thread (parent is a forum channel)
++	// or a normal channel thread
++	parentChannel, err := user.Session.State.Channel(t.ParentID)
++	if err != nil || parentChannel == nil {
++		log.Warn().Err(err).Msg("Parent channel not found in state, skipping thread create")
++		return
++	}
++
++	// Check if parent is a forum or media channel - if so, this is a forum post
++	if parentChannel.Type == discordgo.ChannelTypeGuildForum || parentChannel.Type == discordgo.ChannelTypeGuildMedia {
++		log.Debug().Msg("New forum post thread created")
++		// THREAD_CREATE is only a hint for prompt live bridging: make sure a Thread row
++		// exists and eagerly elect the root. There is no retry or wait logic here - if
++		// this fails, the next message in the thread elects the root via EnsureRoot.
++		user.bridge.forumPostFound(ctx, user, t.ID, t.ParentID, t.Channel)
++	} else if t.Type == discordgo.ChannelTypeGuildPublicThread || t.Type == discordgo.ChannelTypeGuildPrivateThread || t.Type == discordgo.ChannelTypeGuildNewsThread {
++		// Normal channel thread - check if we have a root message
++		msg := user.bridge.DB.Message.GetByDiscordID(database.NewPortalKey(t.ParentID, ""), t.ID)
++		if len(msg) == 0 {
++			log.Debug().Msg("Thread created with no root message, skipping")
+ 		} else {
+-			thread.Parent.ForwardBackfillMissed(user, meta.LastMessageID, thread)
++			log.Debug().Msg("New channel thread with root message, creating thread")
++			user.bridge.threadFound(ctx, user, msg[0], t.ID, t.Channel)
+ 		}
++	} else {
++		log.Debug().Msg("Unhandled thread type")
+ 	}
+ }
+ 
